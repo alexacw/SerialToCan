@@ -8,7 +8,13 @@
 #include <termios.h>
 #include <unistd.h>
 #include <thread>
+
+//‘A’ ‘T’ [29bit ID, big endian ] [3bit: 110 for remote 100 for data] [8bit datalength: MSB to LSB] [n*8bit: data(big endian)] <CR> <LF>
+
 using namespace std;
+
+const uint8_t exteneded_mask = 0b00000100;
+const uint8_t remote_mask = 0b00000010;
 
 int set_interface_attribs(int fd, int speed)
 {
@@ -37,7 +43,7 @@ int set_interface_attribs(int fd, int speed)
 
     /* fetch bytes as they become available */
     tty.c_cc[VMIN] = 1;
-    tty.c_cc[VTIME] = 1;
+    tty.c_cc[VTIME] = 0;
 
     if (tcsetattr(fd, TCSANOW, &tty) != 0)
     {
@@ -47,64 +53,65 @@ int set_interface_attribs(int fd, int speed)
     return 0;
 }
 
-void sendData(int fd, uint32_t ID, bool isRemote, int numOfData, uint8_t data[])
+void sendData(int fd, uint32_t ID, bool isExtended, bool isRemote, uint8_t numOfData, uint8_t data[])
 {
-    int buf_length = 9 + numOfData;
-    char send[buf_length];
-    uint32_t temp;
-    int remote_mode = 6;
-    int data_mode = 4;
+    int buf_length = 2 + 4 + 1 + numOfData + 2;
+    unsigned char send[buf_length];
 
     send[0] = 'A';
     send[1] = 'T';
 
-    if (isRemote)
-        temp = ((ID) << 3 | remote_mode);
-    else
-        temp = ((ID) << 3 | data_mode);
-    //    memcpy(&send[2],&temp,4);
-
-    char a = (temp);
-    char b = (temp >> 8);
-    char c = (temp >> 16);
-    char d = (temp >> 24);
-    send[2] = d;
-    send[3] = c;
-    send[4] = b;
-    send[5] = a;
-
-    char num = (char)(numOfData);
-    send[6] = num;
-
-    int index = 7;
-    for (int i = 0; i < numOfData; i++)
+    if (isExtended)
     {
-        send[index] = data[i];
-        index++;
+        uint32_t temp = (ID) << 3;
+        send[5] = (temp);
+        send[4] = (temp >> 8);
+        send[3] = (temp >> 16);
+        send[2] = (temp >> 24);
+        send[5] |= exteneded_mask;
     }
-    send[index] = '\r';
-    send[index + 1] = '\n';
+    else
+    {
+        uint32_t temp = (ID) << 21;
+        send[5] = (temp);
+        send[4] = (temp >> 8);
+        send[3] = (temp >> 16);
+        send[2] = (temp >> 24);
+        send[5] &= ~exteneded_mask;
+    }
 
-    int numOfChar = sizeof(send);
-    int wlen = write(fd, send, numOfChar);
-    if (wlen != numOfChar)
+    if (isRemote)
+        send[5] |= remote_mask;
+
+    send[6] = numOfData;
+
+    memcpy(&send[7], data, numOfData);
+
+    send[buf_length - 2] = '\r';
+    send[buf_length - 1] = '\n';
+
+    int wlen = write(fd, send, buf_length);
+    if (wlen != buf_length)
     {
         printf("Error from write: %d, %d\n", wlen, errno);
     }
+
+    printf("sent: ");
+    for (int i = 0; i < buf_length; i++)
+        printf("%x ", send[i]);
+    printf("\n");
 }
 
 void send_thread(int fd)
 {
     do
     {
-        char buf[100];
-
         int rdlen;
-        uint32_t testID = 0b01010101010101010101010101010;
-        uint8_t test_data[] = {0b1, 0b110, 0b111};
+        uint32_t testID = 0x7ff;
+        uint8_t test_data[] = {0x01, 0x02, 0x03, 0x04, 0x05};
 
-        sendData(fd, testID, false, 3, test_data);
-        usleep(500000); //millisecond
+        sendData(fd, testID, false, false, sizeof(test_data), test_data);
+        usleep(500000); //1ms
     } while (1);
 }
 
@@ -112,45 +119,53 @@ void receive_thread(int fd)
 {
     do
     {
-        char buf[100];
-        int rdlen = read(fd, buf, sizeof(buf) - 1); //\0
+        unsigned char buf[100];
+        int rdlen = read(fd, buf, 1);
+        printf("Read");
         if (rdlen > 0)
         {
-#ifdef DISPLAY_STRING
-            buf[rdlen] = 0;
-            printf("Read %d: %s", rdlen, buf);
-#else /* display hex */
-            char *p;
+            unsigned char *p;
             printf("Read %d:", rdlen);
             for (p = buf; rdlen-- > 0; p++)
-                printf(" 0x%x", *p);
+                printf(" %x", *p);
             printf("\n");
-#endif
         }
         else if (rdlen < 0)
         {
             printf("Error from read: %d: %s\n", rdlen, strerror(errno));
         }
-        usleep(500000);
     } while (1);
     /* repeat read to get full message */
 }
 
-int main()
+int main(int argc, char **argv)
 {
-    const char *portname = "/dev/ttyUSB1";
-    int fd;
-    int wlen;
+    string portname = "/dev/ttyUSB";
+    if (argc > 1)
+    {
+        std::cout << argv[1][0] << endl;
+        portname += argv[1][0];
+        cout << "opening " << portname << endl;
+    }
 
-    fd = open(portname, O_RDWR | O_NOCTTY | O_SYNC);
+    int fd = open(portname.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
     if (fd < 0)
     {
-        printf("Error opening %s: %s\n", portname, strerror(errno));
+        printf("Error opening %s: %s\n", portname.c_str(), strerror(errno));
         return -1;
     }
 
     /*baudrate 115200, 8 bits, no parity, 1 stop bit */
     set_interface_attribs(fd, B115200);
+
+    usleep(500000); //0.5s
+    char setmodestr[] = "AT+AT\r\n";
+    int wlen = write(fd, setmodestr, sizeof(setmodestr) - 1);
+    if (wlen != sizeof(setmodestr) - 1)
+    {
+        printf("Error from write: %d, %d\n", wlen, errno);
+    }
+    usleep(500000); //0.5s
 
     std::thread task1(send_thread, fd);
     std::thread task2(receive_thread, fd);
